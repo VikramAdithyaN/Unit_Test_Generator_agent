@@ -1,22 +1,31 @@
 from __future__ import annotations
 
+import json
 import os
-from pathlib import Path
+import re
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
+from agent import git_utils
 from agent.prompts import (
+    CLASSIFIER_SYSTEM_V1,
+    GAP_ANALYZER_SYSTEM_V1,
     GENERATOR_SYSTEM_V1,
     PLANNER_SYSTEM_V1,
     REVISION_SYSTEM_V1,
 )
-from agent.sandbox import run_pytest
-from agent.state import AgentState, ChangedFile, FileWorkItem
+from agent.sandbox import run_pytest, run_repo_test_suite
+from agent.state import (
+    AgentState,
+    ChangedFile,
+    CoverageGap,
+    FailureClassification,
+    FileWorkItem,
+)
 from agent.tools import (
     detect_language,
     find_existing_test,
-    read_source,
     test_path_for,
     tier_for,
 )
@@ -30,7 +39,6 @@ def _llm() -> ChatOpenAI:
 
 
 def _strip_fences(text: str) -> str:
-    """Remove markdown code fences if the model included them despite instructions."""
     lines = text.strip().splitlines()
     if lines and lines[0].startswith("```"):
         lines = lines[1:]
@@ -40,29 +48,42 @@ def _strip_fences(text: str) -> str:
 
 
 def ingest_pr(state: AgentState) -> dict:
-    """Read each changed source file from disk and build work items."""
+    """Read base + head content for each changed file via git."""
     repo = state["repo_path"]
-    files_from_input = state.get("work_items", [])
+    pr = state.get("pr_context", {})
+    base_ref = pr.get("base_ref")
+    head_ref = pr.get("head_ref", "HEAD")
+
+    seed_items = state.get("work_items", [])
     work_items: list[FileWorkItem] = []
     errors: list[str] = []
 
-    for item in files_from_input:
+    for item in seed_items:
         rel = item["file"]["path"]
-        try:
-            content = read_source(repo, rel)
-        except FileNotFoundError as exc:
-            errors.append(f"skip {rel}: {exc}")
-            continue
-
         language = detect_language(rel)
         tier = tier_for(language)
+
+        base_content = None
+        if base_ref:
+            base_content = git_utils.read_file_at_ref(repo, base_ref, rel)
+
+        head_content = git_utils.read_file_at_ref(repo, head_ref, rel)
+        if head_content is None:
+            try:
+                from pathlib import Path
+                head_content = (Path(repo) / rel).read_text()
+            except FileNotFoundError:
+                errors.append(f"skip {rel}: not found at head")
+                continue
+
         existing = find_existing_test(repo, rel, language)
 
         cf: ChangedFile = {
             "path": rel,
             "language": language,
             "tier": tier,
-            "content": content,
+            "base_content": base_content,
+            "head_content": head_content,
             "existing_tests": existing,
         }
         work_items.append(
@@ -71,50 +92,113 @@ def ingest_pr(state: AgentState) -> dict:
                 attempts=0,
                 status="pending",
                 test_path=test_path_for(rel, language),
+                coverage_gaps=[],
             )
         )
 
-    return {
-        "work_items": work_items,
-        "current_index": 0,
-        "errors": errors,
-    }
+    return {"work_items": work_items, "current_index": 0, "errors": errors}
 
 
-def plan_tests(state: AgentState) -> dict:
-    """LLM: produce a bullet-point test plan for the current file."""
-    idx = state["current_index"]
+def run_existing_suite(state: AgentState) -> dict:
+    """Run the target repo's own test suite against HEAD."""
+    result = run_repo_test_suite(state["repo_path"])
+    return {"existing_suite": result}
+
+
+_GAP_LINE_RE = re.compile(r"^-\s*(.+?):\s*(.+)$")
+
+
+def compute_coverage_gaps(state: AgentState) -> dict:
+    """LLM: for each file, list coverage gaps the diff touches."""
     items = state["work_items"]
-    item = items[idx]
-    file = item["file"]
+    pr = state.get("pr_context", {})
+    llm = _llm()
 
-    prompt = (
-        f"Language: {file['language']}\n"
-        f"Path: {file['path']}\n\n"
-        f"Source:\n```\n{file['content']}\n```\n"
-    )
-    if file["existing_tests"]:
-        prompt += (
-            f"\nExisting tests nearby (for style reference only):\n"
-            f"```\n{file['existing_tests'][:4000]}\n```\n"
+    for i, item in enumerate(items):
+        file = item["file"]
+        if not file["base_content"] and not file["head_content"]:
+            continue
+
+        user = (
+            f"Language: {file['language']}\n"
+            f"Path: {file['path']}\n\n"
+            f"PR title: {pr.get('title', '(none)')}\n"
+            f"PR body: {pr.get('body', '(none)')[:2000]}\n\n"
+            f"BASE version:\n```\n{(file['base_content'] or '(file did not exist)')[:6000]}\n```\n\n"
+            f"HEAD version:\n```\n{(file['head_content'] or '(file deleted)')[:6000]}\n```\n\n"
+            f"Existing test file:\n```\n{(file['existing_tests'] or '(none found)')[:6000]}\n```\n"
         )
+        resp = llm.invoke([
+            SystemMessage(content=GAP_ANALYZER_SYSTEM_V1),
+            HumanMessage(content=user),
+        ])
+        text = resp.content.strip()
 
-    resp = _llm().invoke([
-        SystemMessage(content=PLANNER_SYSTEM_V1),
-        HumanMessage(content=prompt),
-    ])
+        gaps: list[CoverageGap] = []
+        if text.upper() != "NONE":
+            for line in text.splitlines():
+                m = _GAP_LINE_RE.match(line.strip())
+                if m:
+                    gaps.append(CoverageGap(what=m.group(1).strip(), why=m.group(2).strip()))
 
-    items[idx] = {**item, "plan": resp.content}
+        items[i] = {
+            **item,
+            "coverage_gaps": gaps,
+            "status": "pending" if gaps else "no_gaps",
+        }
+
     return {"work_items": items}
 
 
-def generate_tests(state: AgentState) -> dict:
-    """LLM: generate the test file. Uses revision prompt if this is a retry."""
-    idx = state["current_index"]
+def _next_actionable_index(items: list[FileWorkItem], start: int) -> int:
+    """Advance past files with no gaps."""
+    i = start
+    while i < len(items) and items[i].get("status") == "no_gaps":
+        i += 1
+    return i
+
+
+def plan_tests(state: AgentState) -> dict:
+    """LLM: produce a bullet plan for the current file's gaps, using BASE code."""
     items = state["work_items"]
+    idx = _next_actionable_index(items, state["current_index"])
+    if idx >= len(items):
+        return {"current_index": idx}
+
+    item = items[idx]
+    file = item["file"]
+    pr = state.get("pr_context", {})
+
+    gaps_str = "\n".join(f"- {g['what']}: {g['why']}" for g in item.get("coverage_gaps", []))
+    base = file["base_content"] or file["head_content"] or ""
+
+    user = (
+        f"Language: {file['language']}\n"
+        f"Path: {file['path']}\n"
+        f"PR title: {pr.get('title', '(none)')}\n"
+        f"PR body: {pr.get('body', '(none)')[:1500]}\n\n"
+        f"Coverage gaps to address:\n{gaps_str}\n\n"
+        f"BASE source (source of truth):\n```\n{base[:8000]}\n```\n"
+    )
+    if file["existing_tests"]:
+        user += f"\nExisting tests (style reference only):\n```\n{file['existing_tests'][:3000]}\n```\n"
+
+    resp = _llm().invoke([
+        SystemMessage(content=PLANNER_SYSTEM_V1),
+        HumanMessage(content=user),
+    ])
+    items[idx] = {**item, "plan": resp.content}
+    return {"work_items": items, "current_index": idx}
+
+
+def generate_tests(state: AgentState) -> dict:
+    """LLM: write regression tests from BASE code. Uses revision prompt on retry."""
+    items = state["work_items"]
+    idx = state["current_index"]
     item = items[idx]
     file = item["file"]
     attempt = item.get("attempts", 0)
+    base = file["base_content"] or file["head_content"] or ""
 
     if attempt == 0:
         system = GENERATOR_SYSTEM_V1
@@ -123,21 +207,20 @@ def generate_tests(state: AgentState) -> dict:
             f"Source path: {file['path']}\n"
             f"Test path: {item['test_path']}\n\n"
             f"Plan:\n{item.get('plan', '')}\n\n"
-            f"Source file:\n```\n{file['content']}\n```\n"
+            f"BASE source file:\n```\n{base[:8000]}\n```\n"
         )
         if file["existing_tests"]:
-            user += f"\nExisting test style reference:\n```\n{file['existing_tests'][:4000]}\n```\n"
+            user += f"\nExisting test style reference:\n```\n{file['existing_tests'][:3000]}\n```\n"
     else:
         system = REVISION_SYSTEM_V1
         prev = item.get("test_code", "")
-        err = item.get("execution", {}).get("stderr", "")
-        out = item.get("execution", {}).get("stdout", "")
+        exec_ = item.get("execution", {})
         user = (
-            f"Attempt #{attempt + 1}. The previous test file failed.\n\n"
-            f"Source file ({file['path']}):\n```\n{file['content']}\n```\n\n"
+            f"Attempt #{attempt + 1}.\n\n"
+            f"BASE source file ({file['path']}):\n```\n{base[:8000]}\n```\n\n"
             f"Previous test file:\n```\n{prev}\n```\n\n"
-            f"Runner stderr:\n```\n{err[-3000:]}\n```\n\n"
-            f"Runner stdout:\n```\n{out[-3000:]}\n```\n"
+            f"Runner stderr:\n```\n{exec_.get('stderr', '')[-3000:]}\n```\n\n"
+            f"Runner stdout:\n```\n{exec_.get('stdout', '')[-3000:]}\n```\n"
         )
 
     resp = _llm().invoke([SystemMessage(content=system), HumanMessage(content=user)])
@@ -153,9 +236,9 @@ def generate_tests(state: AgentState) -> dict:
 
 
 def execute_tests(state: AgentState) -> dict:
-    """Run the generated test file. Skips for tier2 or when validation is off."""
-    idx = state["current_index"]
+    """Run the generated test file against HEAD (the copied working tree)."""
     items = state["work_items"]
+    idx = state["current_index"]
     item = items[idx]
     file = item["file"]
 
@@ -173,10 +256,54 @@ def execute_tests(state: AgentState) -> dict:
     return {"work_items": items}
 
 
-def evaluate(state: AgentState) -> str:
-    """Routing node: decide whether to retry, move to next file, or finish."""
-    idx = state["current_index"]
+def classify_failure(state: AgentState) -> dict:
+    """LLM: decide if the failure is intentional (matches PR intent) or suspicious."""
     items = state["work_items"]
+    idx = state["current_index"]
+    item = items[idx]
+    file = item["file"]
+    pr = state.get("pr_context", {})
+    exec_ = item.get("execution", {})
+
+    user = (
+        f"PR title: {pr.get('title', '(none)')}\n"
+        f"PR body: {pr.get('body', '(none)')[:2000]}\n\n"
+        f"BASE source:\n```\n{(file['base_content'] or '')[:6000]}\n```\n\n"
+        f"HEAD source:\n```\n{(file['head_content'] or '')[:6000]}\n```\n\n"
+        f"Failing test file:\n```\n{item.get('test_code', '')[:4000]}\n```\n\n"
+        f"Runner stderr:\n```\n{exec_.get('stderr', '')[-2000:]}\n```\n\n"
+        f"Runner stdout:\n```\n{exec_.get('stdout', '')[-2000:]}\n```\n"
+    )
+    resp = _llm().invoke([
+        SystemMessage(content=CLASSIFIER_SYSTEM_V1),
+        HumanMessage(content=user),
+    ])
+
+    verdict = "unknown"
+    reasoning = resp.content.strip()
+    try:
+        parsed = json.loads(_strip_fences(resp.content))
+        verdict = parsed.get("verdict", "unknown")
+        reasoning = parsed.get("reasoning", reasoning)
+    except json.JSONDecodeError:
+        pass
+
+    classification: FailureClassification = {
+        "verdict": verdict if verdict in ("intentional", "suspicious", "unknown") else "unknown",
+        "reasoning": reasoning,
+    }
+    items[idx] = {
+        **item,
+        "failure_classification": classification,
+        "status": "unverified",
+    }
+    return {"work_items": items}
+
+
+def evaluate(state: AgentState) -> str:
+    """Router: retry, classify (retries exhausted), advance to next file, or finish."""
+    items = state["work_items"]
+    idx = state["current_index"]
     item = items[idx]
     max_attempts = state.get("max_attempts", 3)
     status = item.get("status")
@@ -184,22 +311,30 @@ def evaluate(state: AgentState) -> str:
 
     if status == "failed" and attempts < max_attempts:
         return "retry"
+    if status == "failed":
+        return "classify"
 
-    if idx + 1 < len(items):
+    next_idx = _next_actionable_index(items, idx + 1)
+    if next_idx < len(items):
         return "next"
-
     return "done"
 
 
 def advance_next(state: AgentState) -> dict:
-    return {"current_index": state["current_index"] + 1}
+    items = state["work_items"]
+    next_idx = _next_actionable_index(items, state["current_index"] + 1)
+    return {"current_index": next_idx}
 
 
 def deliver(state: AgentState) -> dict:
-    """CLI-mode deliver: write test files to <repo>/generated_tests/ mirroring paths.
+    """CLI-mode: write generated tests to <repo>/generated_tests/.
+    SCM-mode: no-op; the caller pipeline pulls files off state and pushes them."""
+    mode = state.get("deliver_mode", "cli")
+    if mode != "cli":
+        return {}
 
-    M2 swaps this for SCM branch+PR creation.
-    """
+    from pathlib import Path
+
     out_root = Path(state["repo_path"]) / "generated_tests"
     out_root.mkdir(parents=True, exist_ok=True)
 
