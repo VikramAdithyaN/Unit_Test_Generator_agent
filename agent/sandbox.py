@@ -24,12 +24,18 @@ def _copy_repo(src: Path, dst: Path) -> None:
 
 def _detect_runner(repo: Path) -> str | None:
     """Best-effort: figure out the target repo's test command."""
-    if (repo / "pyproject.toml").exists() or (repo / "pytest.ini").exists() or list(repo.rglob("test_*.py"))[:1]:
+    if (
+        (repo / "pyproject.toml").exists()
+        or (repo / "pytest.ini").exists()
+        or list(repo.rglob("test_*.py"))[:1]
+    ):
         return "pytest"
     if (repo / "package.json").exists():
         return "npm-test"
-    if (repo / "pom.xml").exists():
-        return "mvn-test"
+    if (repo / "pom.xml").exists() or (repo / "build.gradle").exists() or (repo / "build.gradle.kts").exists():
+        return "mvn-or-gradle"
+    if list(repo.rglob("*.csproj"))[:1] or list(repo.rglob("*.sln"))[:1]:
+        return "dotnet-test"
     return None
 
 

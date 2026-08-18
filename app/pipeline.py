@@ -8,51 +8,119 @@ from agent.graph import build_graph
 from agent.state import ChangedFile, FileWorkItem  # noqa: F401 (FileWorkItem re-used in type hints)
 from agent.tools import detect_language
 from app.config import settings
-from app.git_ops import cleanup, clone_pr, push_tests_branch
+from app.git_ops import PushFailed, cleanup, clone_pr, push_tests_branch
 from app.models import DeliveryReport, PRPayload
 from app.scm.factory import get_client
 
 log = logging.getLogger(__name__)
 
-SOURCE_EXTS = {".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rb"}
+SOURCE_EXTS = {
+    ".py", ".js", ".jsx", ".mjs", ".cjs",
+    ".ts", ".tsx", ".java", ".cs", ".go", ".rb",
+}
+
+
+_TEST_MARKERS = (
+    "_test.py", ".test.js", ".test.jsx", ".test.mjs", ".test.cjs",
+    ".test.ts", ".test.tsx", ".spec.js", ".spec.jsx", ".spec.mjs",
+    ".spec.cjs", ".spec.ts", ".spec.tsx", "_test.go", "_spec.rb",
+    "test.java", "tests.java", "test.cs", "tests.cs",
+)
+
+_CONFIG_STEM_MARKERS = (
+    ".config", ".conf", ".setup", "-config", "-setup", "eslintrc",
+    "babel", "webpack", "rollup", "vite.config", "vitest.config",
+    "jest.config", "tsconfig", "prettier", "commitlint",
+)
+
+_CONFIG_FILENAMES = {
+    "setup.py", "conftest.py", "manage.py", "gruntfile.js", "gulpfile.js",
+    "next.config.js", "next.config.mjs", "next.config.ts",
+    "index.d.ts",
+}
 
 
 def _looks_like_test(path: str) -> bool:
     p = path.lower()
-    return (
-        "/test" in p
-        or p.startswith("test")
-        or p.endswith("_test.py")
-        or p.endswith(".test.js")
-        or p.endswith(".test.ts")
-        or p.endswith(".spec.js")
-        or p.endswith(".spec.ts")
-    )
+    if "/__tests__/" in p or "/tests/" in p or "/test/" in p or "/spec/" in p:
+        return True
+    return any(p.endswith(m) for m in _TEST_MARKERS)
+
+
+def _looks_like_config(path: str) -> bool:
+    name = Path(path).name.lower()
+    if name in _CONFIG_FILENAMES:
+        return True
+    stem = Path(path).stem.lower()
+    return any(marker in stem for marker in _CONFIG_STEM_MARKERS)
 
 
 def _filter_source_files(files: list[str]) -> list[str]:
-    return [f for f in files if Path(f).suffix.lower() in SOURCE_EXTS and not _looks_like_test(f)]
+    kept: list[str] = []
+    for f in files:
+        suffix = Path(f).suffix.lower()
+        if suffix not in SOURCE_EXTS:
+            log.info("skip %s: extension %r not in SOURCE_EXTS", f, suffix)
+            continue
+        if _looks_like_test(f):
+            log.info("skip %s: looks like a test file", f)
+            continue
+        if _looks_like_config(f):
+            log.info("skip %s: looks like a config file", f)
+            continue
+        log.info("keep %s", f)
+        kept.append(f)
+    return kept
 
 
-def _build_pr_body(report: DeliveryReport) -> str:
+def _build_pr_body(
+    report: DeliveryReport,
+    files_created: list[str] | None = None,
+    files_modified: list[str] | None = None,
+) -> str:
     lines = [
         f"🤖 Automated test generation for PR #{report.pr_number}",
         "",
         f"**Existing suite:** {report.existing_suite_summary or 'not run'}",
         "",
-        "## Generated tests",
     ]
-    if not report.files_generated:
-        lines.append("_None — no coverage gaps detected._")
-    else:
-        for f in report.files_generated:
+
+    if files_modified:
+        lines.append("## Existing test files updated")
+        lines.append("_New cases were appended to cover the diff; see the diff for details._")
+        for f in files_modified:
             lines.append(f"- `{f}`")
+        lines.append("")
+
+    if files_created:
+        lines.append("## New test files created")
+        for f in files_created:
+            lines.append(f"- `{f}`")
+        lines.append("")
+
+    if not (files_modified or files_created):
+        lines.append("## Generated tests")
+        lines.append("_None — no coverage gaps detected._")
 
     if report.files_skipped_covered:
-        lines.append("")
-        lines.append("## Skipped (already covered)")
+        lines.append("## Skipped (no new gaps for the diff)")
         for f in report.files_skipped_covered:
             lines.append(f"- `{f}`")
+        lines.append("")
+
+    if report.stale_test_refs:
+        lines.append("## ⚠ Reviewer attention — likely stale tests")
+        lines.append(
+            "_These identifiers were removed from the source but are still "
+            "referenced by existing tests. The bot did not touch them; please "
+            "update or delete the stale tests._"
+        )
+        for ref in report.stale_test_refs:
+            idents = ", ".join(f"`{i}`" for i in ref["identifiers"])
+            lines.append(
+                f"- **`{ref['test_file']}`** references removed identifiers "
+                f"from `{ref['source_file']}`: {idents}"
+            )
 
     if report.suspicious_flags:
         lines.append("")
@@ -150,10 +218,23 @@ def run_pipeline(payload: PRPayload) -> DeliveryReport:
             report.existing_suite_summary = f"not run ({suite.get('stderr', 'no runner detected')})"
 
         files_to_push: dict[str, str] = {}
+        files_modified: list[str] = []
+        files_created: list[str] = []
         for item in final_state["work_items"]:
             src_path = item["file"]["path"]
             code = item.get("test_code")
             status = item.get("status", "")
+
+            # Collect stale-ref warnings regardless of whether we generated a
+            # test — the reviewer should see them either way.
+            stale = item.get("stale_refs") or []
+            if stale:
+                report.stale_test_refs.append({
+                    "source_file": src_path,
+                    "test_file": item.get("test_path", ""),
+                    "identifiers": stale,
+                })
+
             if status == "no_gaps":
                 report.files_skipped_covered.append(src_path)
                 continue
@@ -161,6 +242,10 @@ def run_pipeline(payload: PRPayload) -> DeliveryReport:
                 continue
             files_to_push[item["test_path"]] = code
             report.files_generated.append(item["test_path"])
+            if item.get("mode") == "append":
+                files_modified.append(item["test_path"])
+            else:
+                files_created.append(item["test_path"])
 
             cls = item.get("failure_classification") or {}
             if cls.get("verdict") == "suspicious":
@@ -172,14 +257,33 @@ def run_pipeline(payload: PRPayload) -> DeliveryReport:
         if files_to_push:
             tests_branch = f"testgen/pr-{payload.pr_number}-{payload.head_sha[:7]}"
             report.tests_branch = tests_branch
-            push_tests_branch(
-                repo_path,
-                new_branch=tests_branch,
-                from_ref=payload.head_sha,
-                files=files_to_push,
-                commit_message=f"tests: auto-generated for PR #{payload.pr_number}",
-            )
-            pr_body = _build_pr_body(report)
+            try:
+                push_tests_branch(
+                    repo_path,
+                    new_branch=tests_branch,
+                    from_ref=payload.head_sha,
+                    files=files_to_push,
+                    commit_message=f"tests: auto-generated for PR #{payload.pr_number}",
+                )
+            except PushFailed as exc:
+                log.error("push rejected; skipping MR creation")
+                scm.post_pr_comment(
+                    payload,
+                    (
+                        "🤖 **Test-gen bot: push rejected — no MR was opened.**\n\n"
+                        "Generated tests but the remote refused the branch push. "
+                        "Most common cause on enterprise SCMs: push rules "
+                        "(committer email domain, JIRA ref required, or signed "
+                        "commits enforced).\n\n"
+                        f"Branch attempted: `{tests_branch}`\n\n"
+                        "Git said:\n```\n"
+                        f"{str(exc)[:1500]}"
+                        "\n```"
+                    ),
+                )
+                return report
+
+            pr_body = _build_pr_body(report, files_created=files_created, files_modified=files_modified)
             report.tests_pr_url = scm.open_follow_up_pr(
                 payload,
                 source_branch=tests_branch,
@@ -187,10 +291,16 @@ def run_pipeline(payload: PRPayload) -> DeliveryReport:
                 body=pr_body,
             )
         else:
-            scm.post_pr_comment(
-                payload,
-                "🤖 Test-gen bot: no coverage gaps found — existing tests cover the diff.",
-            )
+            msg = "🤖 Test-gen bot: no coverage gaps found — existing tests cover the diff."
+            if report.stale_test_refs:
+                msg += "\n\n**⚠ But there are stale test references you may want to review:**\n"
+                for ref in report.stale_test_refs:
+                    idents = ", ".join(f"`{i}`" for i in ref["identifiers"])
+                    msg += (
+                        f"- `{ref['test_file']}` still references removed "
+                        f"identifiers from `{ref['source_file']}`: {idents}\n"
+                    )
+            scm.post_pr_comment(payload, msg)
 
         for flag in report.suspicious_flags:
             scm.post_pr_comment(

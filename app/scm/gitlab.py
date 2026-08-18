@@ -31,13 +31,21 @@ class GitLabClient(SCMClient):
         event = headers.get("x-gitlab-event", "")
         if event != "Merge Request Hook":
             return None
-        attrs = body_json.get("object_attributes", {})
+        attrs = body_json.get("object_attributes") or {}
         action = attrs.get("action")
         if action not in ("open", "update", "reopen"):
             return None
 
+        source_branch = attrs.get("source_branch") or ""
+        if source_branch.startswith("testgen/"):
+            log.info("ignoring MR from our own testgen branch: %s", source_branch)
+            return None
+
+        last_commit = attrs.get("last_commit") or {}
+        target = attrs.get("target") or {}
+
         project = body_json["project"]
-        user = body_json.get("user", {})
+        user = body_json.get("user") or {}
         return PRPayload(
             scm="gitlab",
             repo_full_name=project["path_with_namespace"],
@@ -45,10 +53,9 @@ class GitLabClient(SCMClient):
             pr_title=attrs.get("title") or "",
             pr_body=attrs.get("description") or "",
             base_ref=attrs["target_branch"],
-            base_sha=attrs.get("last_commit", {}).get("id", "")
-            or attrs.get("target", {}).get("sha", ""),
-            head_ref=attrs["source_branch"],
-            head_sha=attrs.get("last_commit", {}).get("id", ""),
+            base_sha=last_commit.get("id", "") or target.get("sha", ""),
+            head_ref=source_branch,
+            head_sha=last_commit.get("id", ""),
             clone_url=self.clone_url_with_auth(project["path_with_namespace"]),
             author=user.get("username", ""),
             extra={"project_id": project["id"]},

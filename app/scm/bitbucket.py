@@ -39,20 +39,24 @@ class BitbucketClient(SCMClient):
 
         pr = body_json.get("pullrequest") or {}
         repo = body_json.get("repository") or {}
-        src = pr.get("source", {})
-        dest = pr.get("destination", {})
+        src = pr.get("source") or {}
+        dest = pr.get("destination") or {}
+        src_branch = (src.get("branch") or {}).get("name", "")
+        if src_branch.startswith("testgen/"):
+            log.info("ignoring PR from our own testgen branch: %s", src_branch)
+            return None
         return PRPayload(
             scm="bitbucket",
             repo_full_name=repo["full_name"],
             pr_number=pr["id"],
             pr_title=pr.get("title") or "",
             pr_body=pr.get("description") or "",
-            base_ref=dest.get("branch", {}).get("name", ""),
-            base_sha=dest.get("commit", {}).get("hash", ""),
-            head_ref=src.get("branch", {}).get("name", ""),
-            head_sha=src.get("commit", {}).get("hash", ""),
+            base_ref=(dest.get("branch") or {}).get("name", ""),
+            base_sha=(dest.get("commit") or {}).get("hash", ""),
+            head_ref=src_branch,
+            head_sha=(src.get("commit") or {}).get("hash", ""),
             clone_url=self.clone_url_with_auth(repo["full_name"]),
-            author=pr.get("author", {}).get("nickname", ""),
+            author=(pr.get("author") or {}).get("nickname", ""),
         )
 
     def clone_url_with_auth(self, repo_full_name: str) -> str:

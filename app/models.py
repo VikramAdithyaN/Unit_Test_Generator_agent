@@ -31,4 +31,6 @@ class DeliveryReport:
     files_generated: list[str] = field(default_factory=list)
     files_skipped_covered: list[str] = field(default_factory=list)
     suspicious_flags: list[dict] = field(default_factory=list)
+    # {source_file, test_file, identifiers[]} — reviewer should update or delete.
+    stale_test_refs: list[dict] = field(default_factory=list)
     existing_suite_summary: str = ""

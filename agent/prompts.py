@@ -3,20 +3,40 @@ GAP_ANALYZER_SYSTEM_V1 = """You identify coverage gaps for a code change.
 You will be given:
 1. The BASE version of a source file (code before the PR).
 2. The HEAD version (code after the PR).
-3. The existing test file content near this source (if any).
+3. Existing test file content (may be multiple files, each prefixed with
+   `// ===== path =====`). If absent, no tests exist.
 4. The PR title and body.
 
-Your job: list the functions, methods, or behaviors that the DIFF touches
-AND that are NOT already covered by the existing tests.
+Your job: list ONLY the functions, methods, exports, or specific behaviors
+that (a) exist in the file, (b) are affected by the diff, AND (c) have zero
+or clearly inadequate coverage in the provided existing tests.
 
-Rules:
-- Only list items where new tests would add real value.
-- Do NOT list items that appear to be exercised by any existing test, even
-  indirectly. When in doubt, mark as covered.
-- If nothing needs new tests, respond with the single word: NONE
+STRICT RULES — read carefully:
+- The default answer is NONE. Bias heavily toward NONE. Only list a gap if
+  you can point to a specific function/method that has NO existing test.
+- If the existing tests mention a function by name in an import, describe,
+  it(), test(), .toBe(), or .toEqual() assertion — treat it as covered.
+- Do NOT list "edge cases", "boundary conditions", "error paths", or
+  "additional scenarios" as gaps for functions that already have any test.
+  Human reviewers do not want extra tests for functions that already work.
+- Do NOT list gaps for changes that are formatting, renames, comments,
+  imports reorganization, or type-annotation-only.
+- Do NOT list gaps for behaviors the file doesn't have. Don't imagine
+  functionality.
+- If EVERY changed function is mentioned in the existing tests, output NONE.
 
-Output format (one bullet per gap):
-- <function_or_behavior>: <one-line reason it's uncovered>
+If nothing needs new tests, respond with the single word: NONE
+
+Otherwise, output one bullet per genuine gap:
+- <exact_function_or_export_name>: <one-line reason it has NO test>
+
+Example valid response:
+- calculateTax: no existing test imports or invokes calculateTax
+
+Example INVALID responses (do not do this):
+- add(): should also test with negative numbers    ← function has a test
+- divide(): could add more edge cases              ← function has a test
+- config parsing: should validate malformed input  ← too vague, not a name
 """
 
 
@@ -46,14 +66,45 @@ behavior. Do NOT read or infer from the HEAD code — you will not be shown it.
 
 Rules:
 - Use the target language's idiomatic test framework:
-  - python -> pytest
-  - javascript / typescript -> jest / vitest
-  - java -> JUnit 5
+  - python              -> pytest (test_*.py, use fixtures, pytest.raises)
+  - javascript / node   -> jest or vitest (describe/it, expect)
+  - typescript          -> jest or vitest with @types where needed
+  - java                -> JUnit 5 (@Test, assertThrows, @BeforeEach)
+  - csharp / .net       -> xUnit (default) or NUnit if existing tests use it
+                          ([Fact], Assert.Throws<T>, [Theory]+[InlineData])
 - Match the style of any existing tests provided.
-- Mock external dependencies; tests must be hermetic.
-- Cover exactly the plan given.
-- Import the module/functions using the given path.
-- Output ONLY the test file content. No prose, no markdown fences."""
+- Mock external dependencies; tests must be hermetic (no network, no I/O
+  outside tmp, no wall-clock or randomness).
+- Cover exactly the plan given. Do not invent behavior.
+- Import / using the module or namespace under test with the given path.
+- Output ONLY the test file content. No prose, no markdown fences,
+  no leading language tag."""
+
+
+GENERATOR_APPEND_SYSTEM_V1 = """You are ADDING new test cases to an existing test file.
+
+You will be given:
+- The BASE version of a source file (code before the PR).
+- The HEAD version of the source file (code after the PR).
+- The EXISTING test file for that source (current tests).
+- A list of coverage gaps that the diff introduced and existing tests do NOT cover.
+
+Your job: write ONLY the new test cases that cover the listed gaps.
+
+STRICT rules:
+- Output ONLY the new test block(s) — do NOT reprint the existing file.
+- Do NOT reprint imports that already exist in the existing file.
+- If you truly need a new import that isn't already present, put ONLY that
+  new import on the first line, then a blank line, then the new test cases.
+- Match the framework, style, and describe/it (or class/method) structure
+  of the existing file.
+- Reference the module/functions using the SAME import paths the existing
+  file uses. Do not invent new ones.
+- Cover ONLY the listed gaps. Do not add tests for anything else.
+- Do NOT include markdown fences or prose. Output raw code only.
+- Your output will be appended verbatim to the bottom of the existing file,
+  so it must be syntactically valid in that context.
+"""
 
 
 REVISION_SYSTEM_V1 = """You are fixing a failing test file.

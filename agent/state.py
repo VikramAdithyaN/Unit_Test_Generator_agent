@@ -5,7 +5,10 @@ from typing import Annotated, Literal, TypedDict
 from langgraph.graph.message import add_messages
 
 Tier = Literal["tier1", "tier2"]
-Language = Literal["python", "javascript", "typescript", "java", "go", "ruby", "unknown"]
+Language = Literal[
+    "python", "javascript", "typescript", "java", "csharp",
+    "go", "ruby", "unknown",
+]
 
 FailureVerdict = Literal["intentional", "suspicious", "unknown"]
 WorkStatus = Literal[
@@ -66,6 +69,14 @@ class FileWorkItem(TypedDict, total=False):
     coverage_gaps: list[CoverageGap]
     plan: str
     test_path: str
+    # "new"    → create a fresh test file at test_path
+    # "append" → modify the existing test file at test_path in place
+    mode: Literal["new", "append"]
+    existing_test_content: str | None
+    # Identifiers present in BASE source and referenced by existing tests, but
+    # absent from HEAD source — likely stale test references the reviewer
+    # should update or delete. We do not touch them ourselves.
+    stale_refs: list[str]
     test_code: str
     execution: ExecutionResult
     attempts: int

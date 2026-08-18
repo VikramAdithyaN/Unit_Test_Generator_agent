@@ -16,7 +16,10 @@ from agent.tools import detect_language
 app = typer.Typer(add_completion=False, help="LangGraph unit-test generator")
 console = Console()
 
-SOURCE_EXTS = {".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rb"}
+SOURCE_EXTS = {
+    ".py", ".js", ".jsx", ".mjs", ".cjs",
+    ".ts", ".tsx", ".java", ".cs", ".go", ".rb",
+}
 
 
 def _looks_like_test(path: str) -> bool:

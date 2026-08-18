@@ -24,6 +24,16 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
+def _safe_parse(client, headers: dict, body: bytes):
+    """Parse a webhook payload, swallowing malformed-body errors so we never
+    return 500 (SCMs treat 5xx as 'retry me forever')."""
+    try:
+        return client.parse_webhook(headers, json.loads(body))
+    except Exception:
+        log.exception("parse_webhook failed; returning 200 to prevent SCM retries")
+        return None
+
+
 @router.post("/webhook/github")
 async def github_webhook(request: Request, background: BackgroundTasks):
     body = await request.body()
@@ -31,7 +41,7 @@ async def github_webhook(request: Request, background: BackgroundTasks):
     client = GitHubClient()
     if not client.verify_signature(headers, body):
         raise HTTPException(status_code=401, detail="invalid signature")
-    payload = client.parse_webhook(headers, json.loads(body))
+    payload = _safe_parse(client, headers, body)
     if not payload:
         return {"status": "ignored"}
     log.info("accepted github PR #%s on %s", payload.pr_number, payload.repo_full_name)
@@ -46,7 +56,7 @@ async def gitlab_webhook(request: Request, background: BackgroundTasks):
     client = GitLabClient()
     if not client.verify_signature(headers, body):
         raise HTTPException(status_code=401, detail="invalid token")
-    payload = client.parse_webhook(headers, json.loads(body))
+    payload = _safe_parse(client, headers, body)
     if not payload:
         return {"status": "ignored"}
     log.info("accepted gitlab MR !%s on %s", payload.pr_number, payload.repo_full_name)
@@ -61,7 +71,7 @@ async def bitbucket_webhook(request: Request, background: BackgroundTasks):
     client = BitbucketClient()
     if not client.verify_signature(headers, body):
         raise HTTPException(status_code=401, detail="invalid secret")
-    payload = client.parse_webhook(headers, json.loads(body))
+    payload = _safe_parse(client, headers, body)
     if not payload:
         return {"status": "ignored"}
     log.info("accepted bitbucket PR #%s on %s", payload.pr_number, payload.repo_full_name)

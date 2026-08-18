@@ -41,6 +41,9 @@ class GitHubClient(SCMClient):
 
         pr = body_json["pull_request"]
         repo = body_json["repository"]
+        if (pr.get("head", {}).get("ref") or "").startswith("testgen/"):
+            log.info("ignoring PR from our own testgen branch")
+            return None
         return PRPayload(
             scm="github",
             repo_full_name=repo["full_name"],

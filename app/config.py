@@ -12,9 +12,9 @@ class Settings(BaseSettings):
     github_token: str = ""
     github_webhook_secret: str = ""
 
-    gitlab_url: str = "https://gitlab.com"
-    gitlab_token: str = ""
-    gitlab_webhook_secret: str = ""
+    gitlab_url: str = "https://git.fleetcor.com"
+    gitlab_token: str = "pat-1r_jHSsskLQ8SVMxAbHc"
+    gitlab_webhook_secret: str = "TESTING_WEBHOOK_PERSONAL"
 
     bitbucket_username: str = ""
     bitbucket_app_password: str = ""
